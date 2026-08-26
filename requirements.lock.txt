@@ -8,6 +8,7 @@ langchain-community==0.4.1
 langchain-core==1.2.18
 langchain-openai==1.1.11
 langgraph==1.1.2
+langgraph-prebuilt==1.0.8
 langgraph-checkpoint==4.2.0
 langgraph-checkpoint-sqlite==3.1.1
 mineru-open-sdk==0.2.5
