@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-copilot"
+version = "0.2.0"
+description = "Citation-grounded paper RAG and multi-paper comparison agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "langchain==1.2.12",
+  "langchain-core==1.2.18",
+  "langchain-community==0.4.1",
+  "langchain-openai==1.1.11",
+  "langchain-chroma==1.1.0",
+  "langgraph==1.1.2",
+  "langgraph-checkpoint==4.2.0",
+  "langgraph-checkpoint-sqlite==3.1.1",
+  "chromadb==1.5.9",
+  "dashscope==1.25.6",
+  "pymupdf==1.28.2",
+  "streamlit==1.62.0",
+  "arxiv==4.0.1",
+  "mineru-open-sdk==0.2.5",
+  "aiosqlite==0.22.1",
+  "pydantic==2.12.5",
+  "pydantic-settings==2.12.0",
+  "python-dotenv==1.2.1",
+  "rich==14.3.3",
+  "typer==0.24.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.0.3", "pytest-cov==7.1.0", "ruff==0.16.4"]
+
+[project.scripts]
+research-copilot = "research_copilot.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["online: calls external paid or network APIs"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+"src/research_copilot/cli.py" = ["B008"]
