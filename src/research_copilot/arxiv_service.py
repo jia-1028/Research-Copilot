@@ -5,7 +5,8 @@ import time
 from math import ceil
 from pathlib import Path
 from threading import Lock
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import arxiv
 
@@ -22,6 +23,8 @@ ARXIV_ID_PATTERN = re.compile(
 SEARCH_CACHE_TTL_SECONDS = 10 * 60
 RATE_LIMIT_COOLDOWN_SECONDS = 60
 SERVICE_COOLDOWN_SECONDS = 30
+PDF_DOWNLOAD_TIMEOUT_SECONDS = 60
+PDF_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 def normalize_arxiv_id(value: str) -> str:
@@ -106,7 +109,7 @@ class ArxivService:
         download_dir = self.settings.uploads_dir / "arxiv"
         download_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{safe_slug(title)}-{arxiv_id.replace('/', '-')}.pdf"
-        pdf_path = Path(result.download_pdf(dirpath=str(download_dir), filename=filename))
+        pdf_path = self._download_pdf(result.pdf_url, download_dir / filename)
         return self.ingestion.ingest_local(
             pdf_path,
             title=title,
@@ -118,6 +121,143 @@ class ArxivService:
             arxiv_id=arxiv_id,
             prefer_mineru=prefer_mineru,
         )
+
+    def find_import_candidate(
+        self,
+        query: str,
+        *,
+        target_year: int | None = None,
+        require_lightweight: bool = False,
+    ) -> tuple[ArxivPaper | None, list[ArxivPaper]]:
+        """Find the best not-yet-imported paper and report already-known matches.
+
+        The caller can safely use this for a "find and add" workflow: a paper
+        already in the local library is never queued for a duplicate import.
+        """
+
+        candidates = self.search(query, max_results=20)
+        matching = [
+            paper
+            for paper in candidates
+            if self._matches_import_request(
+                paper,
+                target_year=target_year,
+                require_lightweight=require_lightweight,
+            )
+        ]
+        matching.sort(
+            key=lambda paper: self._import_match_score(
+                paper,
+                target_year=target_year,
+                require_lightweight=require_lightweight,
+            ),
+            reverse=True,
+        )
+        if not matching:
+            return None, []
+        already_imported = [
+            paper
+            for paper in matching
+            if paper.already_imported or self.repository.arxiv_id_exists(paper.arxiv_id)
+        ]
+        candidate = next(
+            (
+                paper
+                for paper in matching
+                if not paper.already_imported
+                and not self.repository.arxiv_id_exists(paper.arxiv_id)
+            ),
+            None,
+        )
+        return candidate, already_imported
+
+    @staticmethod
+    def _matches_import_request(
+        paper: ArxivPaper,
+        *,
+        target_year: int | None,
+        require_lightweight: bool,
+    ) -> bool:
+        if target_year is not None and (
+            paper.published_at is None or paper.published_at.year != target_year
+        ):
+            return False
+        text = f"{paper.title}\n{paper.abstract}".casefold()
+        if "mamba" not in text:
+            return False
+        if "medical" not in text or "segmentation" not in text:
+            return False
+        if require_lightweight:
+            return any(
+                keyword in text
+                for keyword in ("lightweight", "efficient", "compact", "light-weight")
+            )
+        return True
+
+    @staticmethod
+    def _import_match_score(
+        paper: ArxivPaper,
+        *,
+        target_year: int | None,
+        require_lightweight: bool,
+    ) -> int:
+        text = f"{paper.title}\n{paper.abstract}".casefold()
+        score = 10 * ("mamba" in text)
+        score += 8 * ("medical" in text and "segmentation" in text)
+        score += 5 * any(
+            keyword in text
+            for keyword in ("lightweight", "efficient", "compact", "light-weight")
+        )
+        score += 20 * (
+            target_year is not None
+            and paper.published_at is not None
+            and paper.published_at.year == target_year
+        )
+        score += 2 * require_lightweight
+        return score
+
+    def _download_pdf(self, pdf_url: str | None, destination: Path) -> Path:
+        """Download an arXiv PDF without relying on a removed SDK helper.
+
+        arxiv 4.x exposes ``Result.pdf_url`` but no longer provides
+        ``Result.download_pdf``. Download to a temporary sibling first so a
+        failed or non-PDF response never becomes an import candidate.
+        """
+        if not pdf_url:
+            raise ResearchCopilotError("arXiv 结果未提供可下载的 PDF 链接")
+
+        temporary_path = destination.with_suffix(".part")
+        request = Request(
+            pdf_url,
+            headers={"User-Agent": "Research-Copilot/0.2 (+local-paper-rag)"},
+        )
+        try:
+            with (
+                urlopen(request, timeout=PDF_DOWNLOAD_TIMEOUT_SECONDS) as response,
+                temporary_path.open("wb") as output,
+            ):
+                while chunk := response.read(PDF_DOWNLOAD_CHUNK_SIZE):
+                    output.write(chunk)
+        except HTTPError as exc:
+            temporary_path.unlink(missing_ok=True)
+            self._raise_http_error(exc)
+        except (URLError, TimeoutError, OSError) as exc:
+            temporary_path.unlink(missing_ok=True)
+            raise ResearchCopilotError(f"arXiv PDF 下载失败：{exc}") from exc
+
+        try:
+            with temporary_path.open("rb") as downloaded:
+                is_pdf = downloaded.read(5) == b"%PDF-"
+            if not is_pdf:
+                raise ResearchCopilotError("arXiv 下载内容不是有效 PDF，已取消导入")
+            temporary_path.replace(destination)
+        except OSError as exc:
+            temporary_path.unlink(missing_ok=True)
+            raise ResearchCopilotError(f"arXiv PDF 保存失败：{exc}") from exc
+        except ResearchCopilotError:
+            temporary_path.unlink(missing_ok=True)
+            raise
+        return destination
 
     def _get_cached_search(self, cache_key: tuple[str, int]) -> list[ArxivPaper] | None:
         with self._lock:

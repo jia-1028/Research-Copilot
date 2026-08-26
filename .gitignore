@@ -10,6 +10,8 @@ htmlcov/
 data/papers/
 data/parsed/
 data/chroma/
+data/.signature_probe/
+data/.hnsw-persist-probe-*/
 data/uploads/
 data/*.db
 data/*.db-*

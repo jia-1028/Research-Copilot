@@ -1151,14 +1151,39 @@ def chat_page() -> None:
                             "Agent 正在识别意图并选择高层工具……",
                             persist,
                         )
-                        result = _run_agent_stream(
-                            agent,
-                            {"messages": [{"role": "user", "content": scoped_prompt}]},
-                            config,
-                            status,
-                            process,
-                            persist,
-                        )
+                        try:
+                            result = _run_agent_stream(
+                                agent,
+                                {"messages": [{"role": "user", "content": scoped_prompt}]},
+                                config,
+                                status,
+                                process,
+                                persist,
+                            )
+                        except Exception as exc:
+                            if (
+                                "insufficient tool messages following tool_calls"
+                                not in str(exc).lower()
+                                or not services.memory.repair_incomplete_agent_checkpoint(
+                                    current["thread_id"]
+                                )
+                            ):
+                                raise
+                            _record_progress(
+                                status,
+                                process,
+                                "检测到上一轮遗留的未完成 Tool Call；已保留对话记录并"
+                                "重置执行状态，正在自动重试本轮……",
+                                persist,
+                            )
+                            result = _run_agent_stream(
+                                agent,
+                                {"messages": [{"role": "user", "content": scoped_prompt}]},
+                                config,
+                                status,
+                                process,
+                                persist,
+                            )
                         if "__interrupt__" in result:
                             status.update(
                                 label="等待人工确认",
@@ -1207,12 +1232,14 @@ def _agent_result_content(result: dict) -> str:
             item
             for item in reversed(messages)
             if isinstance(item, ToolMessage)
-            and item.name == "ask_papers"
+            and item.name in {"ask_papers", "import_arxiv_paper"}
             and item.status != "error"
         ),
         None,
     )
     if direct_tool is not None:
+        if direct_tool.name == "import_arxiv_paper":
+            return str(direct_tool.content)
         artifact = direct_tool.artifact if isinstance(direct_tool.artifact, dict) else None
         return answer_text(direct_tool.content, artifact)
     message = next((item for item in reversed(messages) if isinstance(item, AIMessage)), None)

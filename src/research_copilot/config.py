@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -42,6 +43,7 @@ class Settings(BaseSettings):
     )
     max_visual_pages: int = Field(default=3, alias="MAX_VISUAL_PAGES", ge=1, le=6)
     project_data_dir: Path = Field(default=Path("./data"), alias="PROJECT_DATA_DIR")
+    chroma_data_dir: Path | None = Field(default=None, alias="CHROMA_DATA_DIR")
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE", ge=200, le=5000)
     chunk_overlap: int = Field(default=120, alias="CHUNK_OVERLAP", ge=0, le=1000)
     retrieval_candidate_k: int = Field(default=8, alias="RETRIEVAL_CANDIDATE_K", ge=1, le=30)
@@ -71,12 +73,25 @@ class Settings(BaseSettings):
     def resolve_data_dir(cls, value: Path) -> Path:
         return value if value.is_absolute() else (PROJECT_ROOT / value).resolve()
 
+    @field_validator("chroma_data_dir", mode="after")
+    @classmethod
+    def resolve_chroma_data_dir(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        return value if value.is_absolute() else (PROJECT_ROOT / value).resolve()
+
     @model_validator(mode="after")
     def validate_chunking(self) -> Settings:
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
         if self.retrieval_context_k > self.retrieval_candidate_k:
             raise ValueError("RETRIEVAL_CONTEXT_K cannot exceed RETRIEVAL_CANDIDATE_K")
+        if os.name == "nt" and not str(self.chroma_dir).isascii():
+            raise ValueError(
+                "CHROMA_DATA_DIR 在 Windows 上必须是全英文路径。"
+                "请设置例如 CHROMA_DATA_DIR=E:\\research-copilot-data\\chroma，"
+                "避免 Chroma HNSW 不能在重启后读取索引。"
+            )
         return self
 
     @property
@@ -93,7 +108,7 @@ class Settings(BaseSettings):
 
     @property
     def chroma_dir(self) -> Path:
-        return self.project_data_dir / "chroma"
+        return self.chroma_data_dir or self.project_data_dir / "chroma"
 
     @property
     def sqlite_path(self) -> Path:

@@ -132,6 +132,7 @@ Streamlit 使用 `_cached_runtime(schema_version)` 缓存重量级资源。`runt
 
 - API Key 使用 `SecretStr`，默认打印不会暴露明文；
 - 相对的 `PROJECT_DATA_DIR` 会解析到项目根目录；
+- `CHROMA_DATA_DIR` 可将向量索引与业务数据分离；Windows + Chroma 1.5.9 下应使用全英文绝对路径，避免 HNSW 索引在重启后无法读取；
 - 校验 `chunk_overlap < chunk_size`；
 - 校验最终上下文数量不能超过候选数量；
 - 集中生成 papers、parsed、uploads、chroma、SQLite 和 reports 路径。

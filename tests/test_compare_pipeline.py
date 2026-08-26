@@ -155,6 +155,75 @@ def test_multi_paper_compare_has_nine_rows_and_unique_citations(settings) -> Non
     assert model.calls == 2  # the complete comparison is returned from SQLite cache
 
 
+def test_full_summary_uses_compact_maps_and_local_reduce(settings) -> None:
+    repository = SQLiteRepository(settings.sqlite_path)
+    vectors = MemoryVectorIndex()
+    add_ready_paper(repository, vectors, "paper-a")
+    model = FakeStructuredModel()
+    service = PaperRAGService(settings, repository, vectors, model)
+
+    profile = service.summarize("paper-a")
+
+    assert profile.research_problem.value == "evidence-backed value"
+    assert profile.research_problem.citation_ids == ["paper-a:C1"]
+    assert model.calls == 1  # no long, second LLM Reduce response is generated
+
+
+def test_full_summary_splits_a_length_limited_map_batch(settings) -> None:
+    repository = SQLiteRepository(settings.sqlite_path)
+    vectors = MemoryVectorIndex()
+    add_ready_paper(repository, vectors, "paper-a")
+    vectors.upsert_chunks(
+        [
+            PaperChunk(
+                chunk_id=f"paper-a:v1:p{page:04d}:c000",
+                paper_id="paper-a",
+                paper_version=1,
+                paper_title="PAPER-A",
+                page_number=page,
+                page_index=page - 1,
+                chunk_index_on_page=0,
+                text=f"Evidence on page {page}",
+                text_hash=f"summary-hash-{page}",
+                source_uri="paper-a.pdf",
+                embedding_model="fake",
+            )
+            for page in range(2, 11)
+        ]
+    )
+
+    class LengthLimitedInvoker:
+        def __init__(self, model):
+            self.model = model
+
+        def invoke(self, messages):
+            self.model.calls += 1
+            citation_ids = re.findall(r"\[(C\d+)\]", str(messages[-1].content))
+            if len(citation_ids) > 8:
+                raise RuntimeError(
+                    "Could not parse response content as the length limit was reached"
+                )
+            value = EvidenceValue(value="compact evidence", citation_ids=[citation_ids[0]])
+            return PaperProfileDraft(**{dimension: value for dimension in DIMENSIONS})
+
+    class LengthLimitedModel:
+        def __init__(self):
+            self.calls = 0
+
+        def with_structured_output(self, schema, **_kwargs):
+            assert schema is PaperProfileDraft
+            return LengthLimitedInvoker(self)
+
+    model = LengthLimitedModel()
+    service = PaperRAGService(settings, repository, vectors, model)
+
+    profile = service.summarize("paper-a")
+
+    assert model.calls == 3  # 10 chunks fail once, then two 5-chunk maps succeed
+    assert profile.method_architecture.value == "compact evidence"
+    assert profile.method_architecture.citation_ids == ["paper-a:C1"]
+
+
 def test_paper_question_reports_observable_progress(settings) -> None:
     repository = SQLiteRepository(settings.sqlite_path)
     vectors = MemoryVectorIndex()

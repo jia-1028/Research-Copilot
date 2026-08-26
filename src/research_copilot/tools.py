@@ -31,6 +31,17 @@ class SearchArxivInput(BaseModel):
 
 class ImportArxivInput(BaseModel):
     arxiv_id_or_url: str
+    expected_title: str | None = Field(
+        default=None, description="仅用于人工确认时展示候选论文标题"
+    )
+
+
+class FindArxivImportCandidateInput(BaseModel):
+    query: str = Field(min_length=2, description="用于 arXiv 的英文主题检索式")
+    target_year: int | None = Field(default=None, ge=1991, le=2100)
+    require_lightweight: bool = Field(
+        default=False, description="是否要求标题或摘要明确包含轻量化/高效表述"
+    )
 
 
 class IngestionStatusInput(BaseModel):
@@ -97,16 +108,70 @@ def build_tools(services: ServiceContainer) -> list[BaseTool]:
             for item in services.arxiv.search(query, max_results=max_results)
         ]
 
-    @tool(args_schema=ImportArxivInput)
-    def import_arxiv_paper(arxiv_id_or_url: str) -> dict:
+    @tool(
+        args_schema=ImportArxivInput,
+        response_format="content_and_artifact",
+        return_direct=True,
+    )
+    def import_arxiv_paper(
+        arxiv_id_or_url: str, expected_title: str | None = None
+    ) -> tuple[str, dict]:
         """下载并导入指定 arXiv 论文；该操作需要人工确认。"""
         task_id = services.tasks.submit_arxiv_import(
             arxiv_id_or_url, prefer_mineru=services.settings.mineru_enabled
         )
+        title = f"《{expected_title}》" if expected_title else f"arXiv:{arxiv_id_or_url}"
+        return (
+            f"{title} 已加入后台下载与导入队列。",
+            {"task_id": task_id, "status": "queued", "title": expected_title},
+        )
+
+    @tool(args_schema=FindArxivImportCandidateInput)
+    def find_arxiv_import_candidate(
+        query: str,
+        target_year: int | None = None,
+        require_lightweight: bool = False,
+    ) -> dict:
+        """只搜索一次并选出最匹配的未入库 arXiv 论文，不会下载或导入。"""
+        candidate, already_imported = services.arxiv.find_import_candidate(
+            query,
+            target_year=target_year,
+            require_lightweight=require_lightweight,
+        )
+        criteria = "、".join(
+            item
+            for item in (
+                f"{target_year} 年" if target_year else None,
+                "轻量化/高效" if require_lightweight else None,
+                "Mamba 医学图像分割",
+            )
+            if item
+        )
+        if candidate is None:
+            if already_imported:
+                titles = "；".join(
+                    f"{paper.title}（{paper.arxiv_id}）" for paper in already_imported[:3]
+                )
+                return {
+                    "status": "already_imported",
+                    "message": f"未创建重复导入任务：符合“{criteria}”的候选已在论文库中：{titles}。",
+                    "criteria": criteria,
+                    "papers": [paper.model_dump(mode="json") for paper in already_imported],
+                }
+            return {
+                "status": "not_found",
+                "message": f"未找到同时符合“{criteria}”条件且可导入的 arXiv 论文；未创建导入任务。",
+                "criteria": criteria,
+            }
+
         return {
-            "task_id": task_id,
-            "status": "queued",
-            "message": "arXiv 论文已加入后台下载与导入队列",
+            "status": "candidate_found",
+            "message": f"已找到未入库候选《{candidate.title}》（arXiv:{candidate.arxiv_id}），等待确认导入。",
+            "criteria": criteria,
+            "selected_paper": candidate.model_dump(mode="json"),
+            "already_imported_candidates": [
+                paper.model_dump(mode="json") for paper in already_imported
+            ],
         }
 
     @tool(args_schema=IngestionStatusInput)
@@ -183,6 +248,7 @@ def build_tools(services: ServiceContainer) -> list[BaseTool]:
         import_local_paper,
         search_arxiv,
         import_arxiv_paper,
+        find_arxiv_import_candidate,
         get_ingestion_status,
         ask_papers,
         summarize_paper,

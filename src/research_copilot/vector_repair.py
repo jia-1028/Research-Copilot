@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -16,6 +18,61 @@ from research_copilot.model_factory import create_embedding_model
 from research_copilot.parsers import PyMuPDFParser
 from research_copilot.storage import SQLiteRepository
 from research_copilot.vector_index import ChromaVectorIndex
+
+
+def _validate_reopened_index(
+    persist_directory: Path, collection_name: str, expected_total: int
+) -> None:
+    """Verify a fresh Python process can open and query the replacement index.
+
+    Chroma can keep an in-memory HNSW reader alive in the process that built an
+    index.  A same-process count is therefore insufficient proof that the files
+    on disk are usable after Streamlit restarts.
+    """
+
+    script = """
+import sys
+import chromadb
+
+persist_directory, collection_name, expected_total = sys.argv[1:]
+client = chromadb.PersistentClient(path=persist_directory)
+try:
+    collection = client.get_collection(collection_name)
+    actual_total = collection.count()
+    if actual_total != int(expected_total):
+        raise RuntimeError(f"count mismatch: expected={expected_total}, actual={actual_total}")
+    sample = collection.get(limit=1, include=["embeddings"])
+    embeddings = sample.get("embeddings")
+    if embeddings is None or len(embeddings) == 0:
+        raise RuntimeError("collection contains no stored embedding")
+    result = collection.query(
+        query_embeddings=[[0.0] * len(embeddings[0])], n_results=1
+    )
+    if not result.get("ids") or not result["ids"][0]:
+        raise RuntimeError("query returned no candidates")
+    print(f"ok count={actual_total}")
+finally:
+    client.close()
+"""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(persist_directory),
+            collection_name,
+            str(expected_total),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout or "unknown error").strip()
+        raise ResearchCopilotError(
+            "staging 重启校验失败，未替换生产索引：" + details[-1200:]
+        )
 
 
 def repair_chroma_index(
@@ -38,7 +95,9 @@ def repair_chroma_index(
         raise ResearchCopilotError("没有 ready 论文，无法重建向量索引")
 
     run_id = uuid.uuid4().hex[:12]
-    staging_dir = settings.project_data_dir / f".chroma-rebuild-{run_id}"
+    # The vector directory may be intentionally separated from the rest of
+    # application data (for example, to use an ASCII-only Windows path).
+    staging_dir = settings.chroma_dir.parent / f".chroma-rebuild-{run_id}"
     parse_dir = settings.project_data_dir / f".chroma-repair-parse-{run_id}"
     production_dir = settings.chroma_dir.resolve()
     backup_root = (settings.project_data_dir / "backups").resolve()
@@ -120,6 +179,10 @@ def repair_chroma_index(
 
         index.close()
         index = None
+        _validate_reopened_index(
+            staging_dir, settings.collection_name, actual_total
+        )
+        progress("staging 重启校验通过：新 Python 进程可重新打开并查询 HNSW 索引。")
         if backup_dir.exists():
             raise ResearchCopilotError(f"备份目标已存在：{backup_dir}")
         if production_dir.exists():

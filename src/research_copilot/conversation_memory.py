@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from research_copilot.errors import ResearchCopilotError
 from research_copilot.models import (
@@ -295,6 +295,70 @@ class ConversationMemoryService:
     def delete_permanently(self, thread_id: str) -> None:
         self.checkpointer.delete_thread(thread_id)
         self.repository.delete_conversation(thread_id)
+
+    def repair_incomplete_agent_checkpoint(self, thread_id: str) -> bool:
+        """Drop only a malformed Agent checkpoint while keeping visible history.
+
+        A model response containing tool calls must be followed by one
+        ``ToolMessage`` for every call. If a tool or middleware failure happens
+        between those two writes, LangGraph can retain an invalid checkpoint;
+        the next model request is then rejected before the Agent can continue.
+        SQLite conversation messages remain the user-facing source of truth,
+        so clearing this execution-only checkpoint is safe and recoverable.
+        """
+
+        checkpoint = self.checkpointer.get_tuple(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        if checkpoint is None:
+            return False
+        messages = checkpoint.checkpoint.get("channel_values", {}).get("messages", [])
+        if not self._has_unpaired_tool_call(messages):
+            return False
+
+        visible_messages = self.repository.get_conversation_messages(thread_id)
+        interrupted = next(
+            (
+                item
+                for item in reversed(visible_messages)
+                if item["role"] == "assistant" and item["status"] == "interrupted"
+            ),
+            None,
+        )
+        if interrupted is not None:
+            # A Human-in-the-loop pause intentionally has no completed tool
+            # message yet and must survive a page refresh or application restart.
+            return False
+
+        self.checkpointer.delete_thread(thread_id)
+        logger.warning(
+            "cleared malformed Agent checkpoint thread_id=%s; visible SQLite history preserved",
+            thread_id,
+        )
+        return True
+
+    @staticmethod
+    def _has_unpaired_tool_call(messages: Iterable[Any]) -> bool:
+        pending_ids: set[str] = set()
+        for message in messages:
+            if isinstance(message, AIMessage):
+                call_ids = {
+                    str(call.get("id"))
+                    for call in message.tool_calls
+                    if call.get("id")
+                }
+                if call_ids:
+                    # A second tool-calling response before the first response
+                    # was completed is invalid as well.
+                    if pending_ids:
+                        return True
+                    pending_ids.update(call_ids)
+            elif isinstance(message, ToolMessage):
+                if message.tool_call_id:
+                    pending_ids.discard(str(message.tool_call_id))
+            elif isinstance(message, HumanMessage) and pending_ids:
+                return True
+        return bool(pending_ids)
 
     def _maybe_update_summary(self, thread_id: str) -> None:
         messages = self.repository.get_conversation_messages(thread_id)

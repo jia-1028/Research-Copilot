@@ -33,10 +33,16 @@ from research_copilot.vector_index import VectorIndex
 
 QA_PROMPT_VERSION = "paper-qa-v3"
 QA_EXPANSION_PROMPT_VERSION = "paper-qa-evidence-expansion-v1"
-PROFILE_PROMPT_VERSION = "paper-profile-v1"
+PROFILE_PROMPT_VERSION = "paper-profile-v2"
 FAST_PROFILE_PROMPT_VERSION = "paper-profile-fast-v1"
 FAST_PROFILE_MODE = "dimension_retrieval"
 COMPARISON_PROMPT_VERSION = "paper-comparison-fast-v1"
+SUMMARY_MAX_BATCH_CHUNKS = 20
+SUMMARY_MIN_BATCH_CHUNKS = 8
+SUMMARY_MAP_VALUE_MAX_CHARS = 70
+SUMMARY_MAP_CITATION_LIMIT = 2
+SUMMARY_MERGE_ITEMS_PER_DIMENSION = 3
+SUMMARY_MERGE_CITATION_LIMIT = 6
 DIMENSIONS: tuple[ComparisonDimension, ...] = (
     "research_problem",
     "core_contributions",
@@ -82,6 +88,12 @@ limitations:
 PROFILE_SYSTEM_PROMPT = """从给定论文证据构建结构化论文画像。每个字段都必须是 EvidenceValue：
 value 只写证据支持的内容；citation_ids 只使用给定 [C#]；若无证据则 value 写“证据不足”，
 并设置 insufficient_evidence=true。不得把不同数据集、任务或指标合并成可直接比较的结果。"""
+
+SUMMARY_MAP_SYSTEM_PROMPT = PROFILE_SYSTEM_PROMPT + """
+你正在为全文摘要提取一个短小的局部证据画像，而不是撰写长篇综述。
+每个 value 最多 70 个中文字符或 140 个英文字符，只保留最关键、可核验的事实；
+每个字段最多引用 2 个 [C#]。不得重复论文标题、背景套话或未在本段证据中出现的内容。
+输出必须完整覆盖全部九个字段，无法支持的字段明确标记为证据不足。"""
 
 
 class PaperRAGService:
@@ -429,44 +441,49 @@ class PaperRAGService:
         if not chunks:
             raise ResearchCopilotError(f"论文没有可用文本块：{paper_id}")
 
-        # Map: all pages participate, batched to avoid treating Top-k as a full-paper summary.
+        # Map: all pages participate, but each model response is deliberately
+        # compact. A long PaperProfile JSON can otherwise hit the provider's
+        # completion limit and become unparsable.
         map_profiles: list[PaperProfileDraft] = []
         all_citations: list[Citation] = []
-        batch_size = self.settings.summary_batch_chunks
-        for batch_start in range(0, len(chunks), batch_size):
-            batch = [
-                RetrievedChunk(chunk=chunk)
-                for chunk in chunks[batch_start : batch_start + batch_size]
-            ]
+        batch_size = min(self.settings.summary_batch_chunks, SUMMARY_MAX_BATCH_CHUNKS)
+        pending_batches = [
+            chunks[batch_start : batch_start + batch_size]
+            for batch_start in range(0, len(chunks), batch_size)
+        ]
+        while pending_batches:
+            raw_batch = pending_batches.pop(0)
+            batch = [RetrievedChunk(chunk=chunk) for chunk in raw_batch]
             citations, context = self._build_evidence(batch, start=len(all_citations) + 1)
+            try:
+                profile = self.structured_chat_model.with_structured_output(
+                    PaperProfileDraft
+                ).invoke(
+                    [
+                        SystemMessage(content=SUMMARY_MAP_SYSTEM_PROMPT),
+                        HumanMessage(
+                            content=f"这是论文的一部分，请提取有证据的局部画像：\n{context}"
+                        ),
+                    ]
+                )
+            except Exception as exc:
+                if self._is_summary_length_error(exc) and len(raw_batch) > SUMMARY_MIN_BATCH_CHUNKS:
+                    midpoint = len(raw_batch) // 2
+                    pending_batches[0:0] = [raw_batch[:midpoint], raw_batch[midpoint:]]
+                    continue
+                if self._is_summary_length_error(exc):
+                    raise ResearchCopilotError(
+                        "全文摘要的最小分段仍超出模型输出长度，请稍后重试或降低摘要详细度。"
+                    ) from exc
+                raise
             all_citations.extend(citations)
-            profile = self.structured_chat_model.with_structured_output(
-                PaperProfileDraft
-            ).invoke(
-                [
-                    SystemMessage(content=PROFILE_SYSTEM_PROMPT),
-                    HumanMessage(content=f"这是论文的一部分，请提取有证据的局部画像：\n{context}"),
-                ]
-            )
-            map_profiles.append(self._validate_profile(profile, all_citations))
+            validated = self._validate_profile(profile, citations)
+            map_profiles.append(self._compact_summary_profile(validated))
 
-        # Reduce: merge map outputs while preserving their original citation IDs.
-        reduced = self.structured_chat_model.with_structured_output(
-            PaperProfileDraft
-        ).invoke(
-            [
-                SystemMessage(content=PROFILE_SYSTEM_PROMPT),
-                HumanMessage(
-                    content="合并以下分页/分段画像为整篇论文画像。不得新增事实或引用 ID；"
-                    "有冲突时明确保留限制。\n"
-                    + json.dumps(
-                        [profile.model_dump() for profile in map_profiles],
-                        ensure_ascii=False,
-                    )
-                ),
-            ]
-        )
-        reduced = self._validate_profile(reduced, all_citations)
+        # Reduce locally, rather than asking for a second long JSON response.
+        # This makes every model response bounded and keeps already-completed
+        # map results useful even for a long paper.
+        reduced = self._merge_summary_profiles(map_profiles)
         used_ids = {
             citation_id
             for dimension in DIMENSIONS
@@ -495,6 +512,69 @@ class PaperRAGService:
                 if item.citation_id in used_ids
             ],
         )
+
+    @staticmethod
+    def _is_summary_length_error(exc: Exception) -> bool:
+        message = str(exc).casefold()
+        return "length limit" in message or (
+            "completion_tokens" in message and "parse" in message
+        )
+
+    @staticmethod
+    def _compact_summary_profile(profile: PaperProfileDraft) -> PaperProfileDraft:
+        updates: dict[ComparisonDimension, EvidenceValue] = {}
+        for dimension in DIMENSIONS:
+            value: EvidenceValue = getattr(profile, dimension)
+            text = " ".join(value.value.split())
+            if len(text) > SUMMARY_MAP_VALUE_MAX_CHARS:
+                text = text[: SUMMARY_MAP_VALUE_MAX_CHARS - 1].rstrip() + "…"
+            updates[dimension] = value.model_copy(
+                update={
+                    "value": text,
+                    "citation_ids": list(
+                        OrderedDict.fromkeys(value.citation_ids)
+                    )[:SUMMARY_MAP_CITATION_LIMIT],
+                }
+            )
+        return profile.model_copy(update=updates)
+
+    @staticmethod
+    def _merge_summary_profiles(profiles: list[PaperProfileDraft]) -> PaperProfileDraft:
+        updates: dict[ComparisonDimension, EvidenceValue] = {}
+        for dimension in DIMENSIONS:
+            values: list[EvidenceValue] = []
+            seen_text: set[str] = set()
+            for profile in profiles:
+                value: EvidenceValue = getattr(profile, dimension)
+                text = " ".join(value.value.split())
+                normalized = text.casefold()
+                if (
+                    value.insufficient_evidence
+                    or not text
+                    or normalized == "证据不足"
+                    or normalized in seen_text
+                ):
+                    continue
+                seen_text.add(normalized)
+                values.append(value)
+                if len(values) >= SUMMARY_MERGE_ITEMS_PER_DIMENSION:
+                    break
+            if not values:
+                updates[dimension] = EvidenceValue(
+                    value="证据不足",
+                    insufficient_evidence=True,
+                )
+                continue
+            citation_ids = list(
+                OrderedDict.fromkeys(
+                    citation_id for value in values for citation_id in value.citation_ids
+                )
+            )[:SUMMARY_MERGE_CITATION_LIMIT]
+            updates[dimension] = EvidenceValue(
+                value="\n\n".join(value.value for value in values),
+                citation_ids=citation_ids,
+            )
+        return PaperProfileDraft(**updates)
 
     def compare(self, paper_ids: list[str]) -> PaperComparison:
         if len(OrderedDict.fromkeys(paper_ids)) < 2:

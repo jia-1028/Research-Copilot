@@ -11,6 +11,14 @@ from research_copilot.config import Settings
 from research_copilot.errors import ResearchCopilotError
 from research_copilot.models import PaperChunk, RetrievedChunk
 
+HNSW_CONFIGURATION = {
+    "space": "cosine",
+    "batch_size": 100,
+    # Keep the durable on-disk state close to the write stream.  This limits
+    # recovery work after an unexpected application stop.
+    "sync_threshold": 100,
+}
+
 
 class VectorIndex(Protocol):
     def upsert_chunks(self, chunks: Sequence[PaperChunk]) -> None: ...
@@ -45,11 +53,11 @@ class ChromaVectorIndex:
         self.client = chromadb.PersistentClient(path=str(self.persist_directory))
         self.collection = self.client.get_or_create_collection(
             name=settings.collection_name,
+            configuration={"hnsw": HNSW_CONFIGURATION},
             metadata={
                 "schema_version": "1",
                 "embedding_model": settings.embedding_model,
                 "embedding_dimension": 1024,
-                "hnsw:space": "cosine",
             },
         )
 

@@ -165,7 +165,7 @@ class BackgroundTaskService:
             return result.model_dump(mode="json")
         if task_type == TASK_SUMMARIZE:
             self.repository.update_background_task(
-                task_id, progress=0.25, current_step="正在执行全文 Map-Reduce 摘要"
+                task_id, progress=0.25, current_step="正在执行全文分段摘要与本地证据合并"
             )
             return self.rag.summarize(request["paper_id"]).model_dump(mode="json")
         if task_type == TASK_COMPARE:

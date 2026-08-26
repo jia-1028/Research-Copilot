@@ -16,6 +16,7 @@ def settings(tmp_path: Path) -> Settings:
         MINERU_API_TOKEN="test-mineru-token",
         MINERU_ENABLED=False,
         PROJECT_DATA_DIR=tmp_path / "data",
+        CHROMA_DATA_DIR=tmp_path / "data" / "chroma",
     )
     value.ensure_directories()
     return value
