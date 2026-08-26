@@ -1,0 +1,3 @@
+{"question":"这篇论文试图解决什么问题？","paper_ids":["your-paper-id"],"expected_pages":[1,2],"should_refuse":false}
+{"question":"该方法使用了哪些数据集和评价指标？","paper_ids":["your-paper-id"],"expected_pages":[4,5],"should_refuse":false}
+{"question":"论文是否证明该方法能治疗某种疾病？","paper_ids":["your-paper-id"],"expected_pages":[],"should_refuse":true}
